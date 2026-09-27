@@ -73,9 +73,13 @@ func (s *Store) CreateBatch(ctx context.Context) (string, time.Time, error) {
 	return id, createdAt, err
 }
 
-// GetBatch returns one batch and records ordered by ASCII identifier.
+// GetBatch returns one batch and records ordered by ASCII identifier from a
+// single repeatable-read snapshot.
 func (s *Store) GetBatch(ctx context.Context, id string) (*Batch, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		ReadOnly:  true,
+		Isolation: sql.LevelRepeatableRead,
+	})
 	if err != nil {
 		return nil, err
 	}

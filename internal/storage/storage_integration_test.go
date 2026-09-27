@@ -278,6 +278,105 @@ func TestComputeFailureLeavesEditableDraftAndNoReport(t *testing.T) {
 	}
 }
 
+func TestGetBatchUsesOneSnapshotAcrossBatchAndRecords(t *testing.T) {
+	store, _ := newIsolatedStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	id, _, err := store.CreateBatch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutRecord(ctx, id, "a", "aaa"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetBatch(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold an ACCESS EXCLUSIVE table lock after making the draft changes but
+	// before committing. A GetBatch caller can therefore read batches first and
+	// become blocked on records at the exact boundary between its two queries.
+	writer, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback()
+	if _, err := writer.ExecContext(ctx, `LOCK TABLE records IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(ctx,
+		`UPDATE records SET sequence = 'bbb' WHERE batch_id = $1 AND record_id = 'a'`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(ctx,
+		`UPDATE batches SET sealed = true, updated_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		batch *storage.Batch
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		batch, err := store.GetBatch(ctx, id)
+		resultCh <- result{batch: batch, err: err}
+	}()
+	if !waitForQueryLock(t, ctx, store, `%FROM records%`) {
+		t.Fatal("GetBatch did not reach the locked records query")
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("GetBatch after concurrent commit: %v", got.err)
+		}
+		if got.batch.Sealed {
+			t.Fatal("read mixed states: sealed flag came from the new snapshot")
+		}
+		if !got.batch.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Fatalf("updated_at = %s, want snapshot value %s", got.batch.UpdatedAt, before.UpdatedAt)
+		}
+		if len(got.batch.Records) != 1 || got.batch.Records[0].Sequence != "aaa" {
+			t.Fatalf("records = %+v, want snapshot record aaa", got.batch.Records)
+		}
+	case <-ctx.Done():
+		t.Fatalf("GetBatch did not return after writer commit: %v", ctx.Err())
+	}
+}
+
+func waitForQueryLock(t *testing.T, ctx context.Context, store *storage.Store, queryPattern string) bool {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting int
+		err := store.DB().QueryRowContext(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE pid <> pg_backend_pid()
+			  AND state = 'active'
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE $1`, queryPattern).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("check blocked query: %v", err)
+		}
+		if waiting > 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 func newIsolatedStore(t *testing.T) (*storage.Store, string) {
 	t.Helper()
 	db, schemaName := openTestDatabase(t)

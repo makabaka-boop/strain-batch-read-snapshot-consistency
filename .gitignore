@@ -1,0 +1,15 @@
+# Compiled binaries and local build output
+/server
+/server.exe
+/bin/
+/dist/
+*.test
+*.out
+
+# Local environment and editor files
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+.DS_Store
